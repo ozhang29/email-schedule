@@ -22,7 +22,7 @@ function analyzeMeetingThread(threadContent) {
     'Return this exact JSON structure:\n' +
     '{\n' +
     '  "isSchedulingThread": boolean,\n' +
-    '  "meetingStatus": "inbound_request" | "no_agreement" | "agreement_reached" | "already_scheduled" | "user_promised_times",\n' +
+    '  "meetingStatus": "inbound_request" | "no_agreement" | "agreement_reached" | "already_scheduled" | "user_promised_times" | "awaiting_response",\n' +
     '  "requesterName": "name of person asking to meet" | null,\n' +
     '  "proposedTimes": [{ "proposedBy": "email", "displayText": "...", "startIso": "ISO8601 or null" }],\n' +
     '  "agreedTime": { "startIso": "ISO8601", "endIso": "ISO8601", "timezone": "IANA timezone", "displayText": "human-readable" } | null,\n' +
@@ -35,6 +35,7 @@ function analyzeMeetingThread(threadContent) {
     '}\n\n' +
     'Rules:\n' +
     '- Set meetingStatus to "inbound_request" when the most recent email is someone asking the user to find a time to meet and the user has not yet proposed specific times back.\n' +
+    '- Set meetingStatus to "awaiting_response" when the user\'s most recent email in the thread proposes specific times or shares availability, AND that email is the last message in the thread (the other party has not replied yet).\n' +
     '- Set meetingStatus to "user_promised_times" when the user\'s most recent message promises to send availability (e.g. "I\'ll follow up with some times", "let me find some slots", "I\'ll send a few options") but has not yet done so.\n' +
     '- Set meetingStatus to "agreement_reached" ONLY when both parties have explicitly confirmed the SAME specific time.\n' +
     '- Set meetingStatus to "already_scheduled" if you see language like "I\'ve sent a calendar invite", "check your calendar", "calendar invite sent", or an .ics attachment was noted.\n' +
@@ -205,6 +206,31 @@ function interpretNaturalResponse(userText, proposedAvailability) {
     }
   }
   return { chosenIndex: 0, chosenTime: proposedAvailability[0] };
+}
+
+/**
+ * Drafts a polite follow-up email when awaiting a response.
+ * @param {{ transcript: string, subject: string }} threadContent
+ * @param {number} daysSince - Days since the user's last email.
+ * @returns {string} Plain-text email body.
+ */
+function draftFollowUpEmail(threadContent, daysSince) {
+  var systemPrompt =
+    'You are drafting a short, polite follow-up email on behalf of the user. ' +
+    'Keep it to 2-3 sentences. Friendly and professional — not pushy. ' +
+    'Rules for names: ' +
+    '(1) Address the recipient by their first name if clearly found in their thread signatures. Otherwise write "Hi" with no name. ' +
+    '(2) Sign off with the name the user signs with in the thread, if found. Otherwise just "Best," or "Thanks," with no name. ' +
+    '(3) NEVER write placeholder text like [Your Name], [Name], or anything in square brackets. ' +
+    'Return only the email body, no subject line.';
+
+  var dayDesc = daysSince <= 1 ? 'a day or two' : daysSince + ' days';
+  var userPrompt =
+    'Thread (find real names from signatures here):\n' + threadContent.transcript.substring(0, 3000) + '\n\n' +
+    'The user sent their availability ' + dayDesc + ' ago and has not received a response. ' +
+    'Draft a short, friendly follow-up just checking in. 2-3 sentences.';
+
+  return callAiApi(systemPrompt, userPrompt);
 }
 
 /**

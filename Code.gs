@@ -27,21 +27,22 @@ function buildAddOn(event) {
       return [buildAlreadyScheduledCard(analysis, inviteCheck)];
     }
 
+    if (analysis.meetingStatus === 'awaiting_response') {
+      var lastSentInfo = getLastSentInfo(messageId);
+      return [buildAwaitingResponseCard(analysis, messageId, lastSentInfo)];
+    }
+
     if (analysis.meetingStatus === 'inbound_request') {
-      // If sender proposed times with parseable ISO dates, check calendar availability
       var hasParseable = (analysis.proposedTimes || []).some(function(pt) {
         return pt.startIso && /^\d{4}-\d{2}-\d{2}T/.test(pt.startIso);
       });
-
       if (hasParseable) {
         var proposedAvailability = checkProposedTimes(analysis.proposedTimes, analysis.durationMinutes || 30);
-        // Cache large objects to stay under 2KB action-parameter limit
         var cache = CacheService.getUserCache();
         var cacheKey = Utilities.getUuid();
         cache.put(cacheKey, JSON.stringify({ analysis: analysis, proposedAvailability: proposedAvailability, messageId: messageId }), 600);
         return [buildInboundTimesCard(analysis, proposedAvailability, messageId, cacheKey)];
       }
-
       return [buildInboundRequestCard(analysis, messageId)];
     }
 
@@ -53,7 +54,6 @@ function buildAddOn(event) {
       return [buildReadyToSendCard(analysis, messageId)];
     }
 
-    // Default: no_agreement
     return [buildNoAgreementCard(analysis)];
 
   } catch (e) {
@@ -63,22 +63,65 @@ function buildAddOn(event) {
 }
 
 /**
- * Homepage trigger shown outside a specific email context.
+ * Homepage trigger — shows the in-progress meeting dashboard.
  */
 function buildHomepage() {
   var card = CardService.newCardBuilder()
     .setHeader(CardService.newCardHeader()
       .setTitle('Meeting Scheduler')
-      .setSubtitle('Powered by AI'))
-    .addSection(CardService.newCardSection()
-      .addWidget(CardService.newTextParagraph()
-        .setText('Open any scheduling email thread and this add-on will automatically detect meeting details.\n\n' +
-                 'When both parties have agreed on a time, click <b>Send Google Meet Invite</b> to create a calendar event and send invitations instantly.'))
-      .addWidget(CardService.newTextParagraph()
-        .setText('<b>How it works:</b>\n' +
-                 '1. Open a scheduling email in Gmail\n' +
-                 '2. The add-on reads the thread\n' +
-                 '3. If an agreement is found, send the invite with one click')));
+      .setSubtitle('Dashboard'));
+
+  // --- Needs Follow-up ---
+  var followUpItems = getThreadsForLabel(LABEL_FOLLOWUP, 10);
+  if (followUpItems.length > 0) {
+    var s1 = CardService.newCardSection().setHeader('Needs Follow-up');
+    for (var i = 0; i < followUpItems.length; i++) {
+      var t = followUpItems[i];
+      var label = t.daysSince + ' day' + (t.daysSince !== 1 ? 's' : '') + ' — no reply';
+      s1.addWidget(CardService.newKeyValue()
+        .setTopLabel(label)
+        .setContent(t.subject)
+        .setOpenLink(CardService.newOpenLink().setUrl(t.threadUrl)));
+    }
+    card.addSection(s1);
+  }
+
+  // --- Awaiting Response ---
+  var awaitingItems = getThreadsForLabel(LABEL_AWAITING, 15);
+  var s2 = CardService.newCardSection().setHeader('Awaiting Response');
+  if (awaitingItems.length === 0) {
+    s2.addWidget(CardService.newTextParagraph().setText('No threads currently waiting for a reply.'));
+  } else {
+    for (var i = 0; i < awaitingItems.length; i++) {
+      var t = awaitingItems[i];
+      var label = t.daysSince === 0 ? 'sent today' : t.daysSince + ' day' + (t.daysSince !== 1 ? 's' : '') + ' ago';
+      s2.addWidget(CardService.newKeyValue()
+        .setTopLabel(label)
+        .setContent(t.subject)
+        .setOpenLink(CardService.newOpenLink().setUrl(t.threadUrl)));
+    }
+  }
+  card.addSection(s2);
+
+  // --- Scheduled ---
+  var scheduledItems = getThreadsForLabel(LABEL_SCHEDULED, 5);
+  if (scheduledItems.length > 0) {
+    var s3 = CardService.newCardSection().setHeader('Recently Scheduled');
+    for (var i = 0; i < scheduledItems.length; i++) {
+      var t = scheduledItems[i];
+      s3.addWidget(CardService.newKeyValue()
+        .setTopLabel('Scheduled')
+        .setContent(t.subject)
+        .setOpenLink(CardService.newOpenLink().setUrl(t.threadUrl)));
+    }
+    card.addSection(s3);
+  }
+
+  // --- Setup hint ---
+  card.addSection(CardService.newCardSection()
+    .setHeader('Proactive Reminders')
+    .addWidget(CardService.newTextParagraph()
+      .setText('To enable automatic daily follow-up nudges, run <b>setupSchedulerTrigger()</b> once from the Apps Script editor (Extensions → Apps Script → Run).')));
 
   return card.build();
 }
@@ -145,11 +188,10 @@ function buildAlreadyScheduledCard(analysis, inviteCheck) {
       .setText('<b>Participants:</b> ' + analysis.participantEmails.join(', ')));
   }
 
-  var eventUrl = inviteCheck.eventUrl;
-  if (eventUrl) {
+  if (inviteCheck.eventUrl) {
     section.addWidget(CardService.newTextButton()
       .setText('View in Calendar')
-      .setOpenLink(CardService.newOpenLink().setUrl(eventUrl)));
+      .setOpenLink(CardService.newOpenLink().setUrl(inviteCheck.eventUrl)));
   }
 
   return CardService.newCardBuilder()
@@ -180,9 +222,7 @@ function buildReadyToSendCard(analysis, messageId) {
       .setText('<i>Note: ' + analysis.uncertainty + '</i>'));
   }
 
-  // Pass analysis as JSON so handleSendInvite doesn't need a second AI call
   var analysisJson = JSON.stringify(analysis);
-
   section.addWidget(CardService.newTextButton()
     .setText('Send Google Meet Invite')
     .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
@@ -226,6 +266,52 @@ function buildSuccessCard(createdEvent) {
     .build();
 }
 
+/**
+ * Shown when user has sent availability but the other party hasn't replied yet.
+ */
+function buildAwaitingResponseCard(analysis, messageId, lastSentInfo) {
+  var daysSince = lastSentInfo.daysSince;
+
+  var statusText;
+  if (daysSince === 0) {
+    statusText = 'You sent your availability today. Waiting for their reply.';
+  } else if (daysSince === 1) {
+    statusText = 'You sent your availability yesterday. Waiting for their reply.';
+  } else {
+    statusText = 'You sent your availability ' + daysSince + ' days ago. Still waiting for a reply.';
+  }
+
+  var section = CardService.newCardSection()
+    .setHeader('Awaiting Response')
+    .addWidget(CardService.newTextParagraph().setText(statusText));
+
+  if (analysis.summary) {
+    section.addWidget(CardService.newTextParagraph().setText(analysis.summary));
+  }
+
+  if (daysSince >= 3) {
+    section.addWidget(CardService.newTextParagraph()
+      .setText('<b>It\'s been ' + daysSince + ' days — a follow-up is a good idea.</b>'));
+  }
+
+  var cache = CacheService.getUserCache();
+  var cacheKey = Utilities.getUuid();
+  cache.put(cacheKey, JSON.stringify({ analysis: analysis, messageId: messageId, daysSince: daysSince }), 600);
+
+  var buttonLabel = daysSince >= 3 ? 'Send Follow-up (Overdue)' : 'Send a Follow-up';
+  section.addWidget(CardService.newTextButton()
+    .setText(buttonLabel)
+    .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName('handleGenerateFollowUp')
+      .setParameters({ cacheKey: cacheKey })));
+
+  return CardService.newCardBuilder()
+    .setHeader(CardService.newCardHeader().setTitle('Meeting Scheduler'))
+    .addSection(section)
+    .build();
+}
+
 function buildErrorCard(msg) {
   return CardService.newCardBuilder()
     .setHeader(CardService.newCardHeader().setTitle('Meeting Scheduler'))
@@ -240,9 +326,8 @@ function buildErrorCard(msg) {
 // ---------------------------------------------------------------------------
 
 /**
- * Shared helper: builds the duration dropdown + manual availability form used by
- * buildInboundRequestCard and buildSendAvailabilityCard.
- * Uses CacheService to store analysis (avoids 2KB action-parameter limit).
+ * Shared helper: duration dropdown + manual availability form.
+ * Stores analysis in CacheService to avoid the 2KB action-parameter limit.
  */
 function buildAvailabilityCard(analysis, messageId, sectionHeader, summaryText, buttonText) {
   var section = CardService.newCardSection()
@@ -265,7 +350,6 @@ function buildAvailabilityCard(analysis, messageId, sectionHeader, summaryText, 
     }
   }
 
-  // Duration dropdown — 30 min selected by default
   section.addWidget(CardService.newSelectionInput()
     .setType(CardService.SelectionInputType.DROPDOWN)
     .setFieldName('duration')
@@ -274,14 +358,12 @@ function buildAvailabilityCard(analysis, messageId, sectionHeader, summaryText, 
     .addItem('60 minutes', '60', false)
     .addItem('90 minutes', '90', false));
 
-  // Manual availability text input
   section.addWidget(CardService.newTextInput()
     .setFieldName('manualAvailability')
     .setTitle('Your availability (optional)')
     .setHint('e.g. Mon 2–4 pm, Tue after noon — leave blank to use calendar')
     .setMultiline(true));
 
-  // Store analysis in cache to avoid 2KB parameter limit
   var cache = CacheService.getUserCache();
   var cacheKey = Utilities.getUuid();
   cache.put(cacheKey, JSON.stringify({ analysis: analysis, messageId: messageId }), 600);
@@ -318,8 +400,8 @@ function buildSendAvailabilityCard(analysis, messageId) {
 }
 
 /**
- * Shows sender's proposed times with ✓ Free / ✗ Busy badges checked against the user's calendar.
- * User types a natural language response ("ok", "the first one works", etc.).
+ * Shows sender's proposed times with ✓ Free / ✗ Busy badges.
+ * User types a natural language response to accept one.
  */
 function buildInboundTimesCard(analysis, proposedAvailability, messageId, cacheKey) {
   var section = CardService.newCardSection()
@@ -342,14 +424,12 @@ function buildInboundTimesCard(analysis, proposedAvailability, messageId, cacheK
       .setContent(t.displayText || 'Unknown time'));
   }
 
-  // Natural language input — pre-filled with "ok" for one-tap acceptance
   section.addWidget(CardService.newTextInput()
     .setFieldName('naturalResponse')
     .setTitle('Your response')
     .setHint('e.g. "ok", "the first one works", "let\'s do option 2"')
     .setValue('ok'));
 
-  // Duration dropdown (needed when a calendar invite is created)
   section.addWidget(CardService.newSelectionInput()
     .setType(CardService.SelectionInputType.DROPDOWN)
     .setFieldName('duration')
@@ -372,9 +452,9 @@ function buildInboundTimesCard(analysis, proposedAvailability, messageId, cacheK
 }
 
 /**
- * Shows the AI-drafted email in an editable text field. User can edit then send.
- * @param {string} draftBody - AI-generated email text.
- * @param {string} draftCacheKey - Cache key where send context (mode, messageId, etc.) is stored.
+ * Editable draft preview. User can edit the AI-drafted text before sending.
+ * @param {string} draftBody
+ * @param {string} draftCacheKey - Cache key for send context.
  */
 function buildDraftPreviewCard(draftBody, draftCacheKey) {
   var section = CardService.newCardSection()
@@ -403,9 +483,9 @@ function buildDraftPreviewCard(draftBody, draftCacheKey) {
 
 /**
  * Confirmation card shown after reply is sent.
- * @param {Array} freeSlots - Proposed slots (availability mode).
- * @param {string} manualAvailability - Manual text (availability mode).
- * @param {Object|null} createdEvent - Calendar event info (acceptance mode), or null.
+ * @param {Array} freeSlots
+ * @param {string} manualAvailability
+ * @param {Object|null} createdEvent - Present in acceptance mode (calendar invite created).
  */
 function buildReplySentCard(freeSlots, manualAvailability, createdEvent) {
   var section = CardService.newCardSection()
@@ -414,39 +494,33 @@ function buildReplySentCard(freeSlots, manualAvailability, createdEvent) {
   if (createdEvent) {
     section.addWidget(CardService.newTextParagraph()
       .setText('Your acceptance has been sent and a Google Calendar invite has been created.'));
-
     if (createdEvent.displayTime) {
       section.addWidget(CardService.newKeyValue()
         .setTopLabel('Time')
         .setContent(createdEvent.displayTime));
     }
-
     if (createdEvent.meetUrl) {
       section.addWidget(CardService.newTextButton()
         .setText('Join Google Meet')
         .setOpenLink(CardService.newOpenLink().setUrl(createdEvent.meetUrl)));
     }
-
     if (createdEvent.eventUrl) {
       section.addWidget(CardService.newTextButton()
         .setText('View in Calendar')
         .setOpenLink(CardService.newOpenLink().setUrl(createdEvent.eventUrl)));
     }
-
   } else if (manualAvailability) {
     section.addWidget(CardService.newTextParagraph()
       .setText('Your availability has been sent. You shared:'));
     section.addWidget(CardService.newTextParagraph().setText(manualAvailability));
-
   } else if (freeSlots && freeSlots.length > 0) {
     section.addWidget(CardService.newTextParagraph()
       .setText('Your availability has been sent. You proposed:'));
     for (var i = 0; i < freeSlots.length; i++) {
       section.addWidget(CardService.newKeyValue()
-        .setTopLabel('Option ' + (i + 1))
+        .setTopLabel('Window ' + (i + 1))
         .setContent(freeSlots[i].displayText));
     }
-
   } else {
     section.addWidget(CardService.newTextParagraph().setText('Your reply has been sent.'));
   }
@@ -463,16 +537,13 @@ function buildReplySentCard(freeSlots, manualAvailability, createdEvent) {
 
 /**
  * Handles "Preview Response" on the inbound times card.
- * Interprets natural language, drafts an acceptance email, shows preview.
+ * Interprets natural language, drafts acceptance, shows preview.
  */
 function handleNaturalResponse(event) {
   try {
     var params = event.commonEventObject ? event.commonEventObject.parameters : event.parameters;
-    var cacheKey = params.cacheKey;
-    if (!cacheKey) throw new Error('Missing cacheKey. Please reopen the add-on.');
-
     var cache = CacheService.getUserCache();
-    var cached = cache.get(cacheKey);
+    var cached = cache.get(params.cacheKey);
     if (!cached) throw new Error('Session expired. Please reopen the add-on.');
 
     var stored = JSON.parse(cached);
@@ -483,19 +554,14 @@ function handleNaturalResponse(event) {
     var fi = (event.commonEventObject || {}).formInputs || {};
     var naturalText = fi.naturalResponse && fi.naturalResponse.stringInputs
       ? fi.naturalResponse.stringInputs.value[0] : 'ok';
-    var durationStr = fi.duration && fi.duration.stringInputs
-      ? fi.duration.stringInputs.value[0] : '30';
-    var durationMinutes = parseInt(durationStr, 10) || 30;
+    var durationMinutes = parseInt((fi.duration && fi.duration.stringInputs ? fi.duration.stringInputs.value[0] : '30'), 10) || 30;
 
-    // Interpret which time the user chose
     var interpretation = interpretNaturalResponse(naturalText, proposedAvailability);
     var chosenTime = interpretation.chosenTime;
 
-    // Draft the acceptance email (reads thread for real names)
     var threadContent = getThreadContent(messageId);
     var draftBody = draftAcceptanceEmail(threadContent, chosenTime, analysis);
 
-    // Store context for handleSendDraft
     var draftCacheKey = Utilities.getUuid();
     cache.put(draftCacheKey, JSON.stringify({
       mode: 'acceptance',
@@ -514,20 +580,18 @@ function handleNaturalResponse(event) {
   } catch (e) {
     Logger.log('handleNaturalResponse error: ' + e.message + '\n' + e.stack);
     return CardService.newActionResponseBuilder()
-      .setNavigation(CardService.newNavigation()
-        .pushCard(buildErrorCard(e.message)))
+      .setNavigation(CardService.newNavigation().pushCard(buildErrorCard(e.message)))
       .build();
   }
 }
 
 /**
- * Handles the availability form button click.
- * Gets free slots (or uses manual text), drafts email, shows preview — does NOT send yet.
+ * Handles the availability form button.
+ * Drafts the reply, shows preview — does NOT send yet.
  */
 function handleReplyWithAvailability(event) {
   try {
     var params = event.commonEventObject ? event.commonEventObject.parameters : event.parameters;
-
     var cache = CacheService.getUserCache();
     var analysis, messageId;
 
@@ -538,20 +602,13 @@ function handleReplyWithAvailability(event) {
       analysis = stored.analysis;
       messageId = stored.messageId;
     } else {
-      // Legacy fallback: analysisJson passed directly
-      if (!params.analysisJson || !params.messageId) {
-        throw new Error('Missing required parameters. Please refresh the add-on.');
-      }
+      if (!params.analysisJson || !params.messageId) throw new Error('Missing required parameters.');
       analysis = JSON.parse(params.analysisJson);
       messageId = params.messageId;
     }
 
     var fi = (event.commonEventObject || {}).formInputs || {};
-    var durationStr = fi.duration && fi.duration.stringInputs
-      ? fi.duration.stringInputs.value[0] : '30';
-    var durationMinutes = parseInt(durationStr, 10) || 30;
-
-    // Override AI-detected duration with the user's form selection
+    var durationMinutes = parseInt((fi.duration && fi.duration.stringInputs ? fi.duration.stringInputs.value[0] : '30'), 10) || 30;
     analysis.durationMinutes = durationMinutes;
 
     var manualAvailability = fi.manualAvailability && fi.manualAvailability.stringInputs
@@ -560,15 +617,12 @@ function handleReplyWithAvailability(event) {
     var freeSlots = [];
     if (!manualAvailability) {
       freeSlots = getFreeSlots(durationMinutes, 3);
-      if (freeSlots.length === 0) {
-        throw new Error('No free slots found in the next 14 days between 9am–5pm.');
-      }
+      if (freeSlots.length === 0) throw new Error('No free slots found in the next 14 days between 9am–5pm.');
     }
 
     var threadContent = getThreadContent(messageId);
     var draftBody = draftReplyEmail(threadContent, freeSlots, analysis, manualAvailability, durationMinutes);
 
-    // Store context for handleSendDraft
     var draftCacheKey = Utilities.getUuid();
     cache.put(draftCacheKey, JSON.stringify({
       mode: 'availability',
@@ -585,24 +639,58 @@ function handleReplyWithAvailability(event) {
   } catch (e) {
     Logger.log('handleReplyWithAvailability error: ' + e.message + '\n' + e.stack);
     return CardService.newActionResponseBuilder()
+      .setNavigation(CardService.newNavigation().pushCard(buildErrorCard(e.message)))
+      .build();
+  }
+}
+
+/**
+ * Handles "Send a Follow-up" on the awaiting response card.
+ * Drafts the follow-up email and shows preview.
+ */
+function handleGenerateFollowUp(event) {
+  try {
+    var params = event.commonEventObject ? event.commonEventObject.parameters : event.parameters;
+    var cache = CacheService.getUserCache();
+    var cached = cache.get(params.cacheKey);
+    if (!cached) throw new Error('Session expired. Please reopen the add-on.');
+
+    var stored = JSON.parse(cached);
+    var messageId = stored.messageId;
+    var daysSince = stored.daysSince || 0;
+
+    var threadContent = getThreadContent(messageId);
+    var draftBody = draftFollowUpEmail(threadContent, daysSince);
+
+    var draftCacheKey = Utilities.getUuid();
+    cache.put(draftCacheKey, JSON.stringify({
+      mode: 'followup',
+      messageId: messageId
+    }), 600);
+
+    return CardService.newActionResponseBuilder()
       .setNavigation(CardService.newNavigation()
-        .pushCard(buildErrorCard(e.message)))
+        .pushCard(buildDraftPreviewCard(draftBody, draftCacheKey)))
+      .build();
+
+  } catch (e) {
+    Logger.log('handleGenerateFollowUp error: ' + e.message + '\n' + e.stack);
+    return CardService.newActionResponseBuilder()
+      .setNavigation(CardService.newNavigation().pushCard(buildErrorCard(e.message)))
       .build();
   }
 }
 
 /**
  * Handles the "Send" button on the draft preview card.
- * Sends the (possibly edited) email. For acceptance mode, also creates a calendar invite.
+ * Sends the (possibly edited) email and applies the appropriate tracking label.
+ * For acceptance mode, also creates a calendar invite.
  */
 function handleSendDraft(event) {
   try {
     var params = event.commonEventObject ? event.commonEventObject.parameters : event.parameters;
-    var draftCacheKey = params.draftCacheKey;
-    if (!draftCacheKey) throw new Error('Missing draftCacheKey. Please reopen the add-on.');
-
     var cache = CacheService.getUserCache();
-    var cached = cache.get(draftCacheKey);
+    var cached = cache.get(params.draftCacheKey);
     if (!cached) throw new Error('Session expired. Please reopen the add-on.');
 
     var stored = JSON.parse(cached);
@@ -613,13 +701,20 @@ function handleSendDraft(event) {
     var emailBody = fi.editedDraft && fi.editedDraft.stringInputs
       ? fi.editedDraft.stringInputs.value[0] : '';
 
-    if (!emailBody || !emailBody.trim()) {
-      throw new Error('Email body is empty. Please type a message before sending.');
-    }
+    if (!emailBody || !emailBody.trim()) throw new Error('Email body is empty.');
 
     sendReply(messageId, emailBody.trim());
 
-    if (mode === 'acceptance') {
+    if (mode === 'availability' || mode === 'followup') {
+      // Thread is now awaiting response — label it
+      applyMeetingLabel(messageId, LABEL_AWAITING);
+
+      return CardService.newActionResponseBuilder()
+        .setNavigation(CardService.newNavigation()
+          .pushCard(buildReplySentCard(stored.freeSlots || [], stored.manualAvailability || '', null)))
+        .build();
+
+    } else if (mode === 'acceptance') {
       var chosenTime = stored.chosenTime;
       var durationMinutes = stored.durationMinutes || 30;
       var inviteAnalysis = {
@@ -641,40 +736,45 @@ function handleSendDraft(event) {
         Logger.log('Calendar invite creation failed (non-fatal): ' + inviteErr.message);
       }
 
+      // Meeting is now scheduled — update label
+      clearMeetingLabels(messageId);
+      applyMeetingLabel(messageId, LABEL_SCHEDULED);
+
       return CardService.newActionResponseBuilder()
         .setNavigation(CardService.newNavigation()
           .pushCard(buildReplySentCard([], '', createdEvent)))
         .build();
-
-    } else {
-      return CardService.newActionResponseBuilder()
-        .setNavigation(CardService.newNavigation()
-          .pushCard(buildReplySentCard(stored.freeSlots || [], stored.manualAvailability || '', null)))
-        .build();
     }
+
+    return CardService.newActionResponseBuilder()
+      .setNavigation(CardService.newNavigation()
+        .pushCard(buildReplySentCard([], '', null)))
+      .build();
 
   } catch (e) {
     Logger.log('handleSendDraft error: ' + e.message + '\n' + e.stack);
     return CardService.newActionResponseBuilder()
-      .setNavigation(CardService.newNavigation()
-        .pushCard(buildErrorCard(e.message)))
+      .setNavigation(CardService.newNavigation().pushCard(buildErrorCard(e.message)))
       .build();
   }
 }
 
 /**
- * Handles the "Send Google Meet Invite" button click (agreement_reached flow).
+ * Handles the "Send Google Meet Invite" button (agreement_reached flow).
  */
 function handleSendInvite(event) {
   try {
     var params = event.commonEventObject ? event.commonEventObject.parameters : event.parameters;
-    var analysisJson = params.analysisJson;
-    if (!analysisJson) {
-      throw new Error('Missing analysis data. Please refresh the add-on.');
-    }
+    if (!params.analysisJson) throw new Error('Missing analysis data. Please refresh the add-on.');
 
-    var analysis = JSON.parse(analysisJson);
+    var analysis = JSON.parse(params.analysisJson);
     var createdEvent = createMeetEvent(analysis);
+
+    // Mark as scheduled
+    if (params.messageId) {
+      clearMeetingLabels(params.messageId);
+      applyMeetingLabel(params.messageId, LABEL_SCHEDULED);
+    }
 
     return CardService.newActionResponseBuilder()
       .setNavigation(CardService.newNavigation()
@@ -684,8 +784,7 @@ function handleSendInvite(event) {
   } catch (e) {
     Logger.log('handleSendInvite error: ' + e.message + '\n' + e.stack);
     return CardService.newActionResponseBuilder()
-      .setNavigation(CardService.newNavigation()
-        .pushCard(buildErrorCard(e.message)))
+      .setNavigation(CardService.newNavigation().pushCard(buildErrorCard(e.message)))
       .build();
   }
 }
