@@ -3,8 +3,8 @@
  * Calls OpenAI API to analyze scheduling email threads.
  */
 
-var AI_API_URL = 'https://api.openai.com/v1/chat/completions';
-var AI_MODEL = 'gpt-4o';
+var AI_API_URL    = 'https://api.openai.com/v1/chat/completions';
+var AI_MODEL      = 'gpt-4o';
 var AI_MAX_TOKENS = 1024;
 
 /**
@@ -55,11 +55,9 @@ function analyzeMeetingThread(threadContent) {
 
   try {
     var analysis = JSON.parse(rawResponse);
-    // Attach hasIcsAttachment for CalendarService
     analysis.hasIcsAttachment = threadContent.hasIcsAttachment;
     return analysis;
   } catch (e) {
-    // Attempt to extract JSON from response if there's surrounding text
     var jsonMatch = rawResponse.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       var analysis = JSON.parse(jsonMatch[0]);
@@ -70,17 +68,53 @@ function analyzeMeetingThread(threadContent) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Name-handling helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds a consistent set of name-handling rules for all AI drafting prompts.
+ *
+ * The goal is to produce professional-looking emails that don't expose AI
+ * generation (no [Your Name] placeholders, no guessed names from addresses).
+ *
+ * @param {string} userName - The user's configured sign-off name (may be '').
+ * @returns {string} Ready-to-inject instruction block.
+ */
+function buildNameRules(userName) {
+  var signOffRule = userName
+    ? 'Sign off with exactly "' + userName + '" on its own line — just that name, nothing added before or after.'
+    : 'Sign off exactly as the user does in their own outgoing emails in the thread. If you cannot find a sign-off, end with just "Best," or "Thanks," with no name at all.';
+
+  return (
+    'Name rules — follow precisely:\n' +
+    '(1) TO ADDRESS THE RECIPIENT: Look only at how the other person signs their own outgoing messages. ' +
+    'Use their first name if it clearly appears in their own signature or sign-off lines. ' +
+    'NEVER infer a name from an email address or display name ' +
+    '(e.g. if their address is "aagrawal@company.com" or display is "A. Agrawal", do NOT call them "AAgrawal" or "Agrawal" or "A."). ' +
+    'If in doubt, write just "Hi," or "Hello," with no name.\n' +
+    '(2) TO SIGN OFF: ' + signOffRule + '\n' +
+    '(3) NEVER write placeholder text like [Your Name], [Name], [Recipient], or anything in square brackets.'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Email drafting functions
+// ---------------------------------------------------------------------------
+
 /**
  * Drafts a brief reply email proposing free slots or manual availability text.
  * @param {{ transcript: string, subject: string }} threadContent
  * @param {Array<{ startIso: string, endIso: string, displayText: string }>} freeSlots
  * @param {MeetingAnalysis} analysis
  * @param {string} [manualAvailability] - If non-empty, use this text instead of freeSlots.
- * @param {number} [durationMinutes] - Form-selected duration; overrides analysis value.
+ * @param {number} [durationMinutes] - Form-selected duration.
+ * @param {string} [userName] - The user's configured sign-off name.
  * @returns {string} Plain-text email body.
  */
-function draftReplyEmail(threadContent, freeSlots, analysis, manualAvailability, durationMinutes) {
+function draftReplyEmail(threadContent, freeSlots, analysis, manualAvailability, durationMinutes, userName) {
   var effectiveDuration = durationMinutes || analysis.durationMinutes || 30;
+  var nameRules = buildNameRules(userName || '');
 
   var systemPrompt =
     'You are drafting a professional reply on behalf of the user. ' +
@@ -88,18 +122,14 @@ function draftReplyEmail(threadContent, freeSlots, analysis, manualAvailability,
     '1. One short opening line — thank them for reaching out and say you are sharing some available windows.\n' +
     '2. The availability as a bulleted list (use a dash "-" for each bullet). Each bullet is one availability window exactly as provided — do not rephrase or merge them.\n' +
     '3. One short closing line — ask them to pick a time that works.\n' +
-    '4. Sign-off and name (see rules below).\n' +
-    'Rules for names:\n' +
-    '(1) To address the recipient: look in the thread for their first name from their own signature or sign-off. Use it in the opening if clearly found. Otherwise just write "Hi" with no name.\n' +
-    '(2) To sign off: look in the thread for how the user themselves signs their emails. Use that sign-off if found. If not found, end with just "Best," or "Thanks," with no name.\n' +
-    '(3) NEVER write placeholder text like [Your Name], [Name], or anything in square brackets.\n' +
+    '4. Sign-off.\n' +
+    nameRules + '\n' +
     'Return only the email body text, no subject line.';
 
   var transcript = threadContent.transcript.substring(0, 3000);
   var userPrompt;
 
   if (manualAvailability) {
-    // Format manual text as bullet list if not already bulleted
     var manualLines = manualAvailability.split(/[\n,;]+/).map(function(s) { return s.trim(); }).filter(Boolean);
     var manualBullets = manualLines.map(function(l) { return '- ' + l; }).join('\n');
 
@@ -130,16 +160,16 @@ function draftReplyEmail(threadContent, freeSlots, analysis, manualAvailability,
  * @param {{ transcript: string, subject: string }} threadContent
  * @param {{ displayText: string, startIso: string }} chosenTime
  * @param {MeetingAnalysis} analysis
+ * @param {string} [userName] - The user's configured sign-off name.
  * @returns {string} Plain-text email body.
  */
-function draftAcceptanceEmail(threadContent, chosenTime, analysis) {
+function draftAcceptanceEmail(threadContent, chosenTime, analysis, userName) {
+  var nameRules = buildNameRules(userName || '');
+
   var systemPrompt =
     'You are drafting a short professional acceptance email on behalf of the user. ' +
     'Keep it to 2-3 sentences. ' +
-    'Rules for names: ' +
-    '(1) To address the recipient: look in the thread for their first name from their own signature or sign-off. Use it if clearly found. Otherwise just write "Hi" with no name. ' +
-    '(2) To sign off: look in the thread for how the user themselves signs their emails. Use that if found. If not, end with just "Best," or "Thanks," with no name at all. ' +
-    '(3) NEVER write placeholder text like [Your Name], [Name], or anything in square brackets. ' +
+    nameRules + ' ' +
     'Return only the email body text, no subject line.';
 
   var userPrompt =
@@ -153,13 +183,13 @@ function draftAcceptanceEmail(threadContent, chosenTime, analysis) {
 
 /**
  * Interprets natural language to pick which proposed time the user wants to accept.
- * Fast path: generic affirmatives ("ok", "sure", etc.) pick the first free slot without an AI call.
+ * Fast path: generic affirmatives pick the first free slot without an AI call.
  * @param {string} userText
  * @param {Array<{ displayText:string, startIso:string, free:boolean|null, availLabel:string }>} proposedAvailability
  * @returns {{ chosenIndex: number, chosenTime: object }}
  */
 function interpretNaturalResponse(userText, proposedAvailability) {
-  // Fast path: generic affirmative → first free slot, no AI call needed
+  // Fast path: generic affirmative → first free slot
   var genericOk = /^(ok|okay|good|great|sure|works|fine|sounds good|perfect|yes|yep|yeah|that works|go ahead|do it|either works|any works)[\.\!]?$/i;
   if (!userText || genericOk.test(userText.trim())) {
     for (var i = 0; i < proposedAvailability.length; i++) {
@@ -212,16 +242,16 @@ function interpretNaturalResponse(userText, proposedAvailability) {
  * Drafts a polite follow-up email when awaiting a response.
  * @param {{ transcript: string, subject: string }} threadContent
  * @param {number} daysSince - Days since the user's last email.
+ * @param {string} [userName] - The user's configured sign-off name.
  * @returns {string} Plain-text email body.
  */
-function draftFollowUpEmail(threadContent, daysSince) {
+function draftFollowUpEmail(threadContent, daysSince, userName) {
+  var nameRules = buildNameRules(userName || '');
+
   var systemPrompt =
     'You are drafting a short, polite follow-up email on behalf of the user. ' +
     'Keep it to 2-3 sentences. Friendly and professional — not pushy. ' +
-    'Rules for names: ' +
-    '(1) Address the recipient by their first name if clearly found in their thread signatures. Otherwise write "Hi" with no name. ' +
-    '(2) Sign off with the name the user signs with in the thread, if found. Otherwise just "Best," or "Thanks," with no name. ' +
-    '(3) NEVER write placeholder text like [Your Name], [Name], or anything in square brackets. ' +
+    nameRules + ' ' +
     'Return only the email body, no subject line.';
 
   var dayDesc = daysSince <= 1 ? 'a day or two' : daysSince + ' days';
@@ -232,6 +262,51 @@ function draftFollowUpEmail(threadContent, daysSince) {
 
   return callAiApi(systemPrompt, userPrompt);
 }
+
+/**
+ * Drafts a complete outgoing scheduling email for the compose trigger.
+ * The user provides optional context ("Great to meet you — would love to chat")
+ * and the AI wraps it into a professional email with the available time slots.
+ *
+ * @param {string} contextMessage - Optional user-provided opener/context.
+ * @param {Array<{ displayText: string }>} freeSlots - Available time windows.
+ * @param {number} durationMinutes - Meeting duration.
+ * @param {string} [userName] - The user's configured sign-off name.
+ * @returns {string} Plain-text email body.
+ */
+function draftOutboundEmail(contextMessage, freeSlots, durationMinutes, userName) {
+  var effectiveDuration = durationMinutes || 30;
+  var nameRules = buildNameRules(userName || '');
+
+  var systemPrompt =
+    'You are drafting a professional outgoing email to propose a meeting. ' +
+    'Format:\n' +
+    '1. A natural, brief opening line. If a context message is provided, incorporate it naturally. Otherwise write a friendly opener.\n' +
+    '2. A short transition like "Here are some times that work for me:" or similar.\n' +
+    '3. The availability as a bulleted list (use a dash "-" for each bullet). Each bullet is one time window exactly as provided — do not rephrase.\n' +
+    '4. One short closing line asking them to pick a time that works.\n' +
+    '5. Sign-off.\n' +
+    nameRules + '\n' +
+    'Since this is a new outgoing email, do NOT address anyone by name in the greeting — just write "Hi," unless the context makes a specific greeting natural.\n' +
+    'Return only the email body text, no subject line.';
+
+  var slotBullets = freeSlots.map(function(s) {
+    return '- ' + s.displayText;
+  }).join('\n');
+
+  var userPrompt =
+    'Meeting duration: ' + effectiveDuration + ' minutes\n' +
+    (contextMessage ? 'Context/opening to incorporate: ' + contextMessage + '\n\n' : '\n') +
+    'Availability windows to list as bullets:\n' + slotBullets + '\n\n' +
+    'Write the complete email body.' +
+    (contextMessage ? ' Incorporate the context naturally into the opening.' : '');
+
+  return callAiApi(systemPrompt, userPrompt);
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI API call
+// ---------------------------------------------------------------------------
 
 /**
  * Makes a raw request to the OpenAI Chat Completions API.

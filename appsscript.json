@@ -24,7 +24,11 @@
       "homepageTrigger": { "runFunction": "buildHomepage" }
     },
     "gmail": {
-      "contextualTriggers": [{ "unconditional": {}, "onTriggerFunction": "buildAddOn" }]
+      "contextualTriggers": [{ "unconditional": {}, "onTriggerFunction": "buildAddOn" }],
+      "composeTrigger": {
+        "selectActions": [{ "text": "Insert my availability", "runFunction": "buildComposeCard" }],
+        "draftAccess": "METADATA"
+      }
     }
   }
 }

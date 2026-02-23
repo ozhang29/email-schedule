@@ -117,13 +117,34 @@ function buildHomepage() {
     card.addSection(s3);
   }
 
-  // --- Setup hint ---
-  card.addSection(CardService.newCardSection()
-    .setHeader('Proactive Reminders')
+  // --- Setup & Settings ---
+  var settings = getSettings();
+  var modeNote = settings.autoMode
+    ? 'Mode: <b>Auto</b> — emails send automatically.'
+    : 'Mode: <b>Manual</b> — you review drafts before sending.';
+
+  var settingsSection = CardService.newCardSection()
+    .setHeader('Setup')
+    .addWidget(CardService.newTextParagraph().setText(modeNote))
     .addWidget(CardService.newTextParagraph()
-      .setText('To enable automatic daily follow-up nudges, run <b>setupSchedulerTrigger()</b> once from the Apps Script editor (Extensions → Apps Script → Run).')));
+      .setText('For daily follow-up nudges, run <b>setupSchedulerTrigger()</b> once from the Apps Script editor.'))
+    .addWidget(CardService.newTextButton()
+      .setText('Settings')
+      .setOnClickAction(CardService.newAction()
+        .setFunctionName('handleOpenSettings')));
+
+  card.addSection(settingsSection);
 
   return card.build();
+}
+
+/**
+ * Opens the Settings card.
+ */
+function handleOpenSettings(event) {
+  return CardService.newActionResponseBuilder()
+    .setNavigation(CardService.newNavigation().pushCard(buildSettingsCard()))
+    .build();
 }
 
 // ---------------------------------------------------------------------------
@@ -560,7 +581,8 @@ function handleNaturalResponse(event) {
     var chosenTime = interpretation.chosenTime;
 
     var threadContent = getThreadContent(messageId);
-    var draftBody = draftAcceptanceEmail(threadContent, chosenTime, analysis);
+    var settings = getSettings();
+    var draftBody = draftAcceptanceEmail(threadContent, chosenTime, analysis, settings.userName || '');
 
     var draftCacheKey = Utilities.getUuid();
     cache.put(draftCacheKey, JSON.stringify({
@@ -621,7 +643,8 @@ function handleReplyWithAvailability(event) {
     }
 
     var threadContent = getThreadContent(messageId);
-    var draftBody = draftReplyEmail(threadContent, freeSlots, analysis, manualAvailability, durationMinutes);
+    var settings = getSettings();
+    var draftBody = draftReplyEmail(threadContent, freeSlots, analysis, manualAvailability, durationMinutes, settings.userName || '');
 
     var draftCacheKey = Utilities.getUuid();
     cache.put(draftCacheKey, JSON.stringify({
@@ -660,7 +683,8 @@ function handleGenerateFollowUp(event) {
     var daysSince = stored.daysSince || 0;
 
     var threadContent = getThreadContent(messageId);
-    var draftBody = draftFollowUpEmail(threadContent, daysSince);
+    var settings = getSettings();
+    var draftBody = draftFollowUpEmail(threadContent, daysSince, settings.userName || '');
 
     var draftCacheKey = Utilities.getUuid();
     cache.put(draftCacheKey, JSON.stringify({
